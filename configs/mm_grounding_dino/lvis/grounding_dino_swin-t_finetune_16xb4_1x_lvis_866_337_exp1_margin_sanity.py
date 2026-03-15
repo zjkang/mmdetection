@@ -7,6 +7,7 @@ train_cfg = dict(
     type='IterBasedTrainLoop',
     max_iters=20,
     val_interval=999,
+    val_begin=999,
 )
 
 # Do not load backbone from URL in init_weights; use runner load_from only (local checkpoint)
