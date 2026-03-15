@@ -101,7 +101,8 @@ class RandomSamplingNegPos(BaseTransform):
                  num_sample_negative=85,
                  max_tokens=256,
                  full_sampling_prob=0.5,
-                 label_map_file=None):
+                 label_map_file=None,
+                 confusable_index_path=None):
         if AutoTokenizer is None:
             raise RuntimeError(
                 'transformers is not installed, please install it by: '
@@ -115,6 +116,14 @@ class RandomSamplingNegPos(BaseTransform):
         if label_map_file:
             with open(label_map_file, 'r') as file:
                 self.label_map = json.load(file)
+        self.confusable_index = None
+        if confusable_index_path:
+            with open(confusable_index_path, 'r') as f:
+                raw = json.load(f)
+            # keys are strings, convert to int→list[int]
+            self.confusable_index = {
+                int(k): v for k, v in raw.items()
+            }
 
     def transform(self, results: dict) -> dict:
         if 'phrases' in results:
@@ -201,6 +210,15 @@ class RandomSamplingNegPos(BaseTransform):
                     valid_negative_indexes, size=num_negatives, replace=False):
                 if int(i) not in positive_label_list:
                     negative_label_list.add(i)
+
+        # Force confusable negatives into the prompt so margin loss can fire
+        if self.confusable_index is not None:
+            valid_neg_set = set(int(k) for k in valid_negative_indexes)
+            for gt_lbl in positive_label_list:
+                for neg_id in self.confusable_index.get(gt_lbl, []):
+                    if neg_id not in positive_label_list \
+                            and neg_id in valid_neg_set:
+                        negative_label_list.add(str(neg_id))
 
         random.shuffle(positive_label_list)
 
