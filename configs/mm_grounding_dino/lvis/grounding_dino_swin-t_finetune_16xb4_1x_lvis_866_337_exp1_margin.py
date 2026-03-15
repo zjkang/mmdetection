@@ -63,7 +63,8 @@ train_pipeline = [
         type='PackDetInputs',
         meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
                    'scale_factor', 'flip', 'flip_direction', 'text',
-                   'custom_entities', 'tokens_positive', 'dataset_mode'))
+                   'custom_entities', 'tokens_positive', 'dataset_mode',
+                   'all_label_index_map', 'label_remap_dict'))
 ]
 
 train_dataloader = dict(

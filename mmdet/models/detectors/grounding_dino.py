@@ -434,8 +434,8 @@ class GroundingDINO(DINO):
             ]
             positive_maps = []
             full_positive_maps = []  # full class→token maps for margin loss
-            for token_positive, text_prompt, gt_label in zip(
-                    tokens_positive, text_prompts, gt_labels):
+            for idx, (token_positive, text_prompt, gt_label) in enumerate(
+                    zip(tokens_positive, text_prompts, gt_labels)):
                 tokenized = self.language_model.tokenizer(
                     [text_prompt],
                     padding='max_length'
@@ -447,14 +447,33 @@ class GroundingDINO(DINO):
                 _, positive_map = self.get_positive_map(
                     tokenized, new_tokens_positive)
                 positive_maps.append(positive_map)
-                # Build full positive map covering ALL classes in this prompt.
-                # token_positive is a dict {class_id: [[start, end], ...]}
-                all_class_ids = sorted(token_positive.keys())
-                all_toks = [token_positive[cid] for cid in all_class_ids]
-                _, full_pm = self.get_positive_map(tokenized, all_toks)
-                # Store as dict {class_id (int): token_mask Tensor [L]}
-                full_positive_maps.append(
-                    {cid: full_pm[i] for i, cid in enumerate(all_class_ids)})
+                # Build full positive map for ALL classes in prompt
+                # (pos + neg) using all_label_index_map if available.
+                all_lim = batch_data_samples[idx].metainfo.get(
+                    'all_label_index_map', None)
+                if all_lim is not None:
+                    # all_lim: {orig_cls_id: (prompt_idx, [[s, e]])}
+                    prompt_indices = []
+                    char_spans = []
+                    for orig_id in sorted(all_lim.keys()):
+                        p_idx, spans = all_lim[orig_id]
+                        prompt_indices.append(p_idx)
+                        char_spans.append(spans)
+                    _, full_pm = self.get_positive_map(
+                        tokenized, char_spans)
+                    full_positive_maps.append(
+                        {p_idx: full_pm[j]
+                         for j, p_idx in enumerate(prompt_indices)})
+                else:
+                    # Fallback: only positive classes
+                    all_class_ids = sorted(token_positive.keys())
+                    all_toks = [
+                        token_positive[cid] for cid in all_class_ids]
+                    _, full_pm = self.get_positive_map(
+                        tokenized, all_toks)
+                    full_positive_maps.append(
+                        {cid: full_pm[i]
+                         for i, cid in enumerate(all_class_ids)})
             new_text_prompts = text_prompts
         else:
             new_text_prompts = []

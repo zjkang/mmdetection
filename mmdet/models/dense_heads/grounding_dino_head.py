@@ -546,17 +546,12 @@ class GroundingDINOHead(DINOHead):
         """Compute Pure Margin Loss over the last decoder layer's outputs.
 
         For each matched (query, GT) pair, penalises when confusable negative
-        class scores are within `margin` of the positive class score.
+        class scores are within ``margin`` of the positive class score.
 
-        Args:
-            last_cls (Tensor): [bs, num_matching_queries, max_text_len]
-            last_bbox (Tensor): [bs, num_matching_queries, 4] (norm cxcywh)
-            batch_gt_instances: GT instances per image.
-            batch_img_metas: Image meta per image.
-            batch_data_samples: Data samples containing full_positive_map.
-
-        Returns:
-            Tensor: Scalar margin loss.
+        Uses ``all_label_index_map`` (original class id → token positions
+        for ALL classes in the prompt, including negatives) and
+        ``label_remap_dict`` (original id → prompt-local id) to map between
+        the remapped GT labels and the original confusable_index ids.
         """
         all_pos_scores = []
         all_neg_scores = []
@@ -568,10 +563,19 @@ class GroundingDINOHead(DINOHead):
             cls_score_i = last_cls[i]   # [nq, max_text_len]
             bbox_pred_i = last_bbox[i]  # [nq, 4]
 
-            # full_positive_map: {class_id (int): token_mask Tensor [L]}
-            if not hasattr(data_sample, 'full_positive_map'):
+            # all_label_index_map: {orig_cls_id: (prompt_idx, [[s,e]])}
+            all_lim = img_meta.get('all_label_index_map', None)
+            remap = img_meta.get('label_remap_dict', None)
+            if all_lim is None or remap is None:
                 continue
-            full_pm = data_sample.full_positive_map
+
+            # Build inverse remap: prompt-local id → original class id
+            inv_remap = {v: k for k, v in remap.items()}
+
+            # Build full positive map for ALL classes in prompt using
+            # the same tokenizer output stored in data_sample
+            full_pm = data_sample.full_positive_map \
+                if hasattr(data_sample, 'full_positive_map') else None
 
             # Re-run Hungarian matching (no grad — only to get indices)
             img_h, img_w = img_meta['img_shape']
@@ -597,31 +601,41 @@ class GroundingDINOHead(DINOHead):
             gt_labels_matched = gt_instances.labels[pos_gt_inds]
 
             for q_idx, gt_lbl in zip(pos_inds, gt_labels_matched):
-                cls_id = gt_lbl.item()
-                neg_ids = self.confusable_mgr.get_negatives(cls_id)
+                # gt_lbl is prompt-local (remapped) id; convert to original
+                local_id = gt_lbl.item()
+                orig_cls_id = inv_remap.get(local_id, None)
+                if orig_cls_id is None:
+                    continue
+
+                neg_ids = self.confusable_mgr.get_negatives(orig_cls_id)
                 if not neg_ids:
                     continue
 
-                # Score for positive class
-                if cls_id not in full_pm:
+                # Score for positive class via full_positive_map
+                if full_pm is not None and local_id in full_pm:
+                    pos_mask = full_pm[local_id].to(cls_score_i.device)
+                    active_pos = pos_mask > 0
+                    if active_pos.sum() == 0:
+                        continue
+                    s_pos = cls_score_i[q_idx, active_pos].mean()
+                else:
                     continue
-                pos_mask = full_pm[cls_id].to(cls_score_i.device)
-                active_pos = pos_mask > 0
-                if active_pos.sum() == 0:
-                    continue
-                s_pos = cls_score_i[q_idx, active_pos].mean()
 
-                # Scores for confusable negatives (only those in the prompt)
+                # Scores for confusable negatives using all_label_index_map
                 neg_scores_list = []
                 for neg_id in neg_ids:
-                    if neg_id not in full_pm:
+                    if neg_id not in all_lim:
                         continue
-                    neg_mask = full_pm[neg_id].to(cls_score_i.device)
-                    active_neg = neg_mask > 0
-                    if active_neg.sum() == 0:
-                        continue
-                    neg_scores_list.append(
-                        cls_score_i[q_idx, active_neg].mean())
+                    neg_prompt_idx, _ = all_lim[neg_id]
+                    # Look up in full_pm using prompt_idx
+                    if full_pm is not None and neg_prompt_idx in full_pm:
+                        neg_mask = full_pm[neg_prompt_idx].to(
+                            cls_score_i.device)
+                        active_neg = neg_mask > 0
+                        if active_neg.sum() == 0:
+                            continue
+                        neg_scores_list.append(
+                            cls_score_i[q_idx, active_neg].mean())
 
                 if not neg_scores_list:
                     continue
@@ -633,8 +647,6 @@ class GroundingDINOHead(DINOHead):
         if not all_pos_scores:
             return last_cls.new_zeros(1).squeeze()
 
-        # Pad neg scores to same K (PlainMarginLoss handles variable K via
-        # individual per-pair computation here)
         total_loss = last_cls.new_zeros(1).squeeze()
         for s_pos, s_neg in zip(all_pos_scores, all_neg_scores):
             total_loss = total_loss + self.margin_loss_fn(

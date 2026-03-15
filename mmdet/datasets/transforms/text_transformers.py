@@ -74,6 +74,8 @@ def generate_senetence_given_labels(positive_label_list, negative_label_list,
     pheso_caption = ''
 
     label_remap_dict = {}
+    # Map from original class id to prompt-local index for ALL classes
+    all_label_index_map = {}
     for index, label in enumerate(label_list):
 
         start_index = len(pheso_caption)
@@ -81,6 +83,9 @@ def generate_senetence_given_labels(positive_label_list, negative_label_list,
         pheso_caption += clean_name(text[str(label)])
 
         end_index = len(pheso_caption)
+
+        # Record token positions for ALL classes (pos + neg)
+        all_label_index_map[int(label)] = (index, [[start_index, end_index]])
 
         if label in positive_label_list:
             label_to_positions[index] = [[start_index, end_index]]
@@ -90,7 +95,8 @@ def generate_senetence_given_labels(positive_label_list, negative_label_list,
         #     pheso_caption += '. '
         pheso_caption += '. '
 
-    return label_to_positions, pheso_caption, label_remap_dict
+    return label_to_positions, pheso_caption, label_remap_dict, \
+        all_label_index_map
 
 
 @TRANSFORMS.register_module()
@@ -240,7 +246,8 @@ class RandomSamplingNegPos(BaseTransform):
             else:
                 break
         negative_label_list = screened_negative_label_list
-        label_to_positions, pheso_caption, label_remap_dict = \
+        label_to_positions, pheso_caption, label_remap_dict, \
+            all_label_index_map = \
             generate_senetence_given_labels(positive_label_list,
                                             negative_label_list, text)
 
@@ -253,6 +260,11 @@ class RandomSamplingNegPos(BaseTransform):
 
         results['text'] = pheso_caption
         results['tokens_positive'] = label_to_positions
+        # Pass original-id → token positions for ALL classes in prompt
+        # (used by margin loss to look up confusable negatives)
+        results['all_label_index_map'] = all_label_index_map
+        # Also pass original-id → prompt-local remap for GT classes
+        results['label_remap_dict'] = label_remap_dict
 
         return results
 
