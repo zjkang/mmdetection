@@ -12,3 +12,7 @@ train_cfg = dict(
 
 # Do not load backbone from URL in init_weights; use runner load_from only (local checkpoint)
 model = dict(backbone=dict(init_cfg=None))
+
+# Print every iter so we can see losses in the 20-iter sanity run
+default_hooks = dict(logger=dict(type='LoggerHook', interval=1))
+log_processor = dict(window_size=1)
