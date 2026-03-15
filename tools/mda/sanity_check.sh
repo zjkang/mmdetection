@@ -9,7 +9,7 @@
 
 NUM_GPUS=${1:-1}
 
-EXP1_CFG="configs/mm_grounding_dino/lvis/grounding_dino_swin-t_finetune_16xb4_1x_lvis_866_337_exp1_margin.py"
+EXP1_CFG="configs/mm_grounding_dino/lvis/grounding_dino_swin-t_finetune_16xb4_1x_lvis_866_337_exp1_margin_sanity.py"
 SANITY_DIR="work_dirs/mda_ovlvis/sanity_check_$(date +%Y%m%d_%H%M%S)"
 
 echo "=== Sanity Check: Exp-1 (20 iters, 1 GPU) ==="
@@ -17,8 +17,7 @@ python tools/train.py \
     "${EXP1_CFG}" \
     --work-dir "${SANITY_DIR}" \
     --cfg-options \
-        train_cfg.max_iters=20 \
-        train_cfg.val_interval=999 \
+        load_from=checkpoints/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth \
         default_hooks.checkpoint.interval=999 \
         log_processor.window_size=5 \
         model.bbox_head.margin_config.warmup_iters=0
