@@ -17,6 +17,8 @@ python tools/train.py \
     "${EXP1_CFG}" \
     --work-dir "${SANITY_DIR}" \
     --cfg-options \
+        train_dataloader.batch_size=2 \
+        train_dataloader.num_workers=2 \
         load_from=checkpoints/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth \
         default_hooks.checkpoint.interval=999 \
         log_processor.window_size=5 \
