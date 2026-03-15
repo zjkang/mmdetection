@@ -16,6 +16,7 @@ from mmdet.structures import SampleList
 from mmdet.structures.bbox import bbox_cxcywh_to_xyxy, bbox_xyxy_to_cxcywh
 from mmdet.utils import InstanceList, reduce_mean
 from ..layers import inverse_sigmoid
+from ..mda import ConfusableSetManager, PlainMarginLoss
 from .atss_vlfusion_head import convert_grounding_to_cls_scores
 from .dino_head import DINOHead
 
@@ -97,12 +98,36 @@ class GroundingDINOHead(DINOHead):
     Args:
         contrastive_cfg (dict, optional): Contrastive config that contains
           keys like ``max_text_len``. Defaults to dict(max_text_len=256).
+        margin_config (dict, optional): Config for Pure Margin Loss.
+          Keys:
+            - confusable_index_path (str): Path to confusable_index.json.
+            - margin (float): Margin value. Defaults to 0.2.
+            - loss_weight (float): Weight for margin loss. Defaults to 0.5.
+            - num_negatives (int): Number of confusable negatives. Defaults 3.
+            - warmup_iters (int): Skip margin loss for first N iters. Default 500.
+          If None, margin loss is disabled. Defaults to None.
     """
 
-    def __init__(self, contrastive_cfg=dict(max_text_len=256), **kwargs):
+    def __init__(self,
+                 contrastive_cfg=dict(max_text_len=256),
+                 margin_config=None,
+                 **kwargs):
         self.contrastive_cfg = contrastive_cfg
         self.max_text_len = contrastive_cfg.get('max_text_len', 256)
+        self.margin_config = margin_config
         super().__init__(**kwargs)
+        # Initialise margin loss components (after super().__init__)
+        if margin_config is not None:
+            self.confusable_mgr = ConfusableSetManager(
+                margin_config['confusable_index_path'],
+                num_negatives=margin_config.get('num_negatives', 3))
+            self.margin_loss_fn = PlainMarginLoss(
+                margin=margin_config.get('margin', 0.2))
+            self.margin_loss_weight = margin_config.get('loss_weight', 0.5)
+            self.margin_warmup_iters = margin_config.get('warmup_iters', 500)
+            self._margin_iter = 0
+        else:
+            self.confusable_mgr = None
 
     def _init_layers(self) -> None:
         """Initialize classification branch and regression branch of head."""
@@ -497,7 +522,125 @@ class GroundingDINOHead(DINOHead):
         loss_inputs = outs + (enc_outputs_class, enc_outputs_coord,
                               batch_gt_instances, batch_img_metas, dn_meta)
         losses = self.loss_by_feat(*loss_inputs)
+
+        # Pure Margin Loss (Exp-1)
+        if self.confusable_mgr is not None:
+            self._margin_iter += 1
+            if self._margin_iter > self.margin_warmup_iters:
+                # Split matching vs denoising queries; use last decoder layer
+                (all_matching_cls, all_matching_bbox, _, _) = \
+                    self.split_outputs(outs[0], outs[1], dn_meta)
+                last_cls = all_matching_cls[-1]   # [bs, nq, max_text_len]
+                last_bbox = all_matching_bbox[-1]  # [bs, nq, 4]
+                loss_margin = self._compute_margin_loss(
+                    last_cls, last_bbox, batch_gt_instances,
+                    batch_img_metas, batch_data_samples)
+                losses['loss_margin'] = loss_margin * self.margin_loss_weight
+
         return losses
+
+    def _compute_margin_loss(self, last_cls: Tensor, last_bbox: Tensor,
+                             batch_gt_instances: InstanceList,
+                             batch_img_metas: List[dict],
+                             batch_data_samples: SampleList) -> Tensor:
+        """Compute Pure Margin Loss over the last decoder layer's outputs.
+
+        For each matched (query, GT) pair, penalises when confusable negative
+        class scores are within `margin` of the positive class score.
+
+        Args:
+            last_cls (Tensor): [bs, num_matching_queries, max_text_len]
+            last_bbox (Tensor): [bs, num_matching_queries, 4] (norm cxcywh)
+            batch_gt_instances: GT instances per image.
+            batch_img_metas: Image meta per image.
+            batch_data_samples: Data samples containing full_positive_map.
+
+        Returns:
+            Tensor: Scalar margin loss.
+        """
+        all_pos_scores = []
+        all_neg_scores = []
+
+        for i in range(len(batch_gt_instances)):
+            gt_instances = batch_gt_instances[i]
+            img_meta = batch_img_metas[i]
+            data_sample = batch_data_samples[i]
+            cls_score_i = last_cls[i]   # [nq, max_text_len]
+            bbox_pred_i = last_bbox[i]  # [nq, 4]
+
+            # full_positive_map: {class_id (int): token_mask Tensor [L]}
+            if not hasattr(data_sample, 'full_positive_map'):
+                continue
+            full_pm = data_sample.full_positive_map
+
+            # Re-run Hungarian matching (no grad — only to get indices)
+            img_h, img_w = img_meta['img_shape']
+            factor = bbox_pred_i.new_tensor(
+                [img_w, img_h, img_w, img_h]).unsqueeze(0)
+            bbox_xyxy = bbox_cxcywh_to_xyxy(bbox_pred_i) * factor
+
+            with torch.no_grad():
+                pred_inst = InstanceData(
+                    scores=cls_score_i, bboxes=bbox_xyxy)
+                assign_result = self.assigner.assign(
+                    pred_instances=pred_inst,
+                    gt_instances=gt_instances,
+                    img_meta=img_meta)
+
+            pos_inds = torch.nonzero(
+                assign_result.gt_inds > 0,
+                as_tuple=False).squeeze(-1).unique()
+            if len(pos_inds) == 0:
+                continue
+
+            pos_gt_inds = assign_result.gt_inds[pos_inds] - 1
+            gt_labels_matched = gt_instances.labels[pos_gt_inds]
+
+            for q_idx, gt_lbl in zip(pos_inds, gt_labels_matched):
+                cls_id = gt_lbl.item()
+                neg_ids = self.confusable_mgr.get_negatives(cls_id)
+                if not neg_ids:
+                    continue
+
+                # Score for positive class
+                if cls_id not in full_pm:
+                    continue
+                pos_mask = full_pm[cls_id].to(cls_score_i.device)
+                active_pos = pos_mask > 0
+                if active_pos.sum() == 0:
+                    continue
+                s_pos = cls_score_i[q_idx, active_pos].mean()
+
+                # Scores for confusable negatives (only those in the prompt)
+                neg_scores_list = []
+                for neg_id in neg_ids:
+                    if neg_id not in full_pm:
+                        continue
+                    neg_mask = full_pm[neg_id].to(cls_score_i.device)
+                    active_neg = neg_mask > 0
+                    if active_neg.sum() == 0:
+                        continue
+                    neg_scores_list.append(
+                        cls_score_i[q_idx, active_neg].mean())
+
+                if not neg_scores_list:
+                    continue
+
+                all_pos_scores.append(s_pos)
+                all_neg_scores.append(
+                    torch.stack(neg_scores_list))  # [K_avail]
+
+        if not all_pos_scores:
+            return last_cls.new_zeros(1).squeeze()
+
+        # Pad neg scores to same K (PlainMarginLoss handles variable K via
+        # individual per-pair computation here)
+        total_loss = last_cls.new_zeros(1).squeeze()
+        for s_pos, s_neg in zip(all_pos_scores, all_neg_scores):
+            total_loss = total_loss + self.margin_loss_fn(
+                s_pos.unsqueeze(0),
+                s_neg.unsqueeze(0))
+        return total_loss / len(all_pos_scores)
 
     def loss_by_feat_single(self, cls_scores: Tensor, bbox_preds: Tensor,
                             batch_gt_instances: InstanceList,

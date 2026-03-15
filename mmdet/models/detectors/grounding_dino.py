@@ -433,6 +433,7 @@ class GroundingDINO(DINO):
                 for data_samples in batch_data_samples
             ]
             positive_maps = []
+            full_positive_maps = []  # full class→token maps for margin loss
             for token_positive, text_prompt, gt_label in zip(
                     tokens_positive, text_prompts, gt_labels):
                 tokenized = self.language_model.tokenizer(
@@ -446,10 +447,19 @@ class GroundingDINO(DINO):
                 _, positive_map = self.get_positive_map(
                     tokenized, new_tokens_positive)
                 positive_maps.append(positive_map)
+                # Build full positive map covering ALL classes in this prompt.
+                # token_positive is a dict {class_id: [[start, end], ...]}
+                all_class_ids = sorted(token_positive.keys())
+                all_toks = [token_positive[cid] for cid in all_class_ids]
+                _, full_pm = self.get_positive_map(tokenized, all_toks)
+                # Store as dict {class_id (int): token_mask Tensor [L]}
+                full_positive_maps.append(
+                    {cid: full_pm[i] for i, cid in enumerate(all_class_ids)})
             new_text_prompts = text_prompts
         else:
             new_text_prompts = []
             positive_maps = []
+            full_positive_maps = []
             if len(set(text_prompts)) == 1:
                 # All the text prompts are the same,
                 # so there is no need to calculate them multiple times.
@@ -457,6 +467,13 @@ class GroundingDINO(DINO):
                     self.get_tokens_and_prompts(
                         text_prompts[0], True)
                 new_text_prompts = [caption_string] * len(batch_inputs)
+                # tokens_positive is a list; build full map once
+                _, full_pm_shared = self.get_positive_map(
+                    tokenized, tokens_positive)
+                shared_full_pm = {
+                    i: full_pm_shared[i]
+                    for i in range(len(tokens_positive))
+                }
                 for gt_label in gt_labels:
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
@@ -464,6 +481,7 @@ class GroundingDINO(DINO):
                     _, positive_map = self.get_positive_map(
                         tokenized, new_tokens_positive)
                     positive_maps.append(positive_map)
+                    full_positive_maps.append(shared_full_pm)
             else:
                 for text_prompt, gt_label in zip(text_prompts, gt_labels):
                     tokenized, caption_string, tokens_positive, _ = \
@@ -476,6 +494,10 @@ class GroundingDINO(DINO):
                         tokenized, new_tokens_positive)
                     positive_maps.append(positive_map)
                     new_text_prompts.append(caption_string)
+                    _, full_pm = self.get_positive_map(
+                        tokenized, tokens_positive)
+                    full_positive_maps.append(
+                        {i: full_pm[i] for i in range(len(tokens_positive))})
 
         text_dict = self.language_model(new_text_prompts)
         if self.text_feat_map is not None:
@@ -489,6 +511,8 @@ class GroundingDINO(DINO):
             data_samples.gt_instances.text_token_mask = \
                 text_token_mask.unsqueeze(0).repeat(
                     len(positive_map), 1)
+            # Store full class→token map for margin loss (CPU tensors)
+            data_samples.full_positive_map = full_positive_maps[i]
         if self.use_autocast:
             with autocast(enabled=True):
                 visual_features = self.extract_feat(batch_inputs)
