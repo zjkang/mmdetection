@@ -20,6 +20,11 @@ optim_wrapper = dict(
 
 param_scheduler = []
 
+# Speed up validation: larger chunked_size = fewer forward passes
+model = dict(test_cfg=dict(chunked_size=200))
+
+val_dataloader = dict(batch_size=4)
+
 default_hooks = dict(
     logger=dict(type='LoggerHook', interval=50),
     checkpoint=dict(
