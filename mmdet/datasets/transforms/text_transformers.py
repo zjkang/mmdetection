@@ -111,7 +111,8 @@ class RandomSamplingNegPos(BaseTransform):
                  confusable_index_path=None,
                  mda_attributes_path=None,
                  lvis_categories_path=None,
-                 mda_max_attr_tokens=6):
+                 mda_max_attr_tokens=6,
+                 mda_aug_prob=0.5):
         if AutoTokenizer is None:
             raise RuntimeError(
                 'transformers is not installed, please install it by: '
@@ -137,6 +138,7 @@ class RandomSamplingNegPos(BaseTransform):
         # MDA attribute augmentation (Exp-3)
         # Maps (cont_idx_a, cont_idx_b) → (attr_for_a, attr_for_b)
         self.mda_pair_attrs = None
+        self.mda_aug_prob = mda_aug_prob
         if mda_attributes_path and lvis_categories_path:
             self._build_mda_lookup(
                 mda_attributes_path, lvis_categories_path,
@@ -206,7 +208,7 @@ class RandomSamplingNegPos(BaseTransform):
                 pair = (lid, partner)
                 if pair in self.mda_pair_attrs:
                     candidates.append(self.mda_pair_attrs[pair][0])
-            if candidates:
+            if candidates and random.random() < self.mda_aug_prob:
                 # Randomly pick one so different epochs see different attrs
                 attr_for_label[lid] = random.choice(candidates)
 
