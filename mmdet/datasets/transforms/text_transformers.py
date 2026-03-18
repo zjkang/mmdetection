@@ -198,16 +198,17 @@ class RandomSamplingNegPos(BaseTransform):
         attr_for_label = {}
 
         for lid in all_ids_set:
+            # Collect all candidate attributes from confusable partners
+            candidates = []
             for partner in all_ids_set:
                 if lid == partner:
                     continue
                 pair = (lid, partner)
                 if pair in self.mda_pair_attrs:
-                    attr = self.mda_pair_attrs[pair][0]
-                    # Keep shortest attribute if multiple partners
-                    if lid not in attr_for_label or \
-                            len(attr) < len(attr_for_label[lid]):
-                        attr_for_label[lid] = attr
+                    candidates.append(self.mda_pair_attrs[pair][0])
+            if candidates:
+                # Randomly pick one so different epochs see different attrs
+                attr_for_label[lid] = random.choice(candidates)
 
         if not attr_for_label:
             return text
