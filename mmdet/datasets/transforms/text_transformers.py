@@ -108,7 +108,10 @@ class RandomSamplingNegPos(BaseTransform):
                  max_tokens=256,
                  full_sampling_prob=0.5,
                  label_map_file=None,
-                 confusable_index_path=None):
+                 confusable_index_path=None,
+                 mda_attributes_path=None,
+                 lvis_categories_path=None,
+                 mda_max_attr_tokens=6):
         if AutoTokenizer is None:
             raise RuntimeError(
                 'transformers is not installed, please install it by: '
@@ -130,6 +133,91 @@ class RandomSamplingNegPos(BaseTransform):
             self.confusable_index = {
                 int(k): v for k, v in raw.items()
             }
+
+        # MDA attribute augmentation (Exp-3)
+        # Maps (cont_idx_a, cont_idx_b) → (attr_for_a, attr_for_b)
+        self.mda_pair_attrs = None
+        if mda_attributes_path and lvis_categories_path:
+            self._build_mda_lookup(
+                mda_attributes_path, lvis_categories_path,
+                mda_max_attr_tokens)
+
+    def _build_mda_lookup(self, mda_attributes_path, lvis_categories_path,
+                          max_attr_tokens):
+        """Build pair-indexed MDA attribute lookup with pre-truncated text."""
+        with open(mda_attributes_path, 'r') as f:
+            mda_attrs = json.load(f)
+        with open(lvis_categories_path, 'r') as f:
+            cats_data = json.load(f)
+
+        name_to_idx = {}
+        for cat in cats_data['categories']:
+            name_to_idx[cat['name']] = cat['cont_idx']
+
+        self.mda_pair_attrs = {}
+        for pair_key, attrs in mda_attrs.items():
+            parts = pair_key.split('|')
+            if len(parts) != 2:
+                continue
+            name_a, name_b = parts
+            idx_a = name_to_idx.get(name_a)
+            idx_b = name_to_idx.get(name_b)
+            if idx_a is None or idx_b is None:
+                continue
+
+            # Truncate attribute text to max_attr_tokens BERT tokens
+            attr_a = self._truncate_attr(attrs['attr_a'], max_attr_tokens)
+            attr_b = self._truncate_attr(attrs['attr_b'], max_attr_tokens)
+
+            self.mda_pair_attrs[(idx_a, idx_b)] = (attr_a, attr_b)
+            self.mda_pair_attrs[(idx_b, idx_a)] = (attr_b, attr_a)
+
+        print(f'MDA augmentation: loaded {len(self.mda_pair_attrs)} '
+              f'pair entries (max_attr_tokens={max_attr_tokens})')
+
+    def _truncate_attr(self, attr_text, max_tokens):
+        """Truncate attribute text to fit within max BERT tokens."""
+        attr_text = attr_text.lower().strip()
+        tokens = self.tokenizer.tokenize(attr_text)
+        if len(tokens) <= max_tokens:
+            return attr_text
+        # Decode truncated tokens back to text
+        token_ids = self.tokenizer.convert_tokens_to_ids(tokens[:max_tokens])
+        return self.tokenizer.decode(token_ids).strip()
+
+    def _augment_text_with_mda(self, text, all_label_ids):
+        """Augment class names with MDA attributes for confusable pairs.
+
+        Only augments when both classes of a pair are in the prompt.
+        Returns a shallow copy of text with augmented names.
+        """
+        if self.mda_pair_attrs is None:
+            return text
+
+        all_ids_set = set(int(x) for x in all_label_ids)
+        attr_for_label = {}
+
+        for lid in all_ids_set:
+            for partner in all_ids_set:
+                if lid == partner:
+                    continue
+                pair = (lid, partner)
+                if pair in self.mda_pair_attrs:
+                    attr = self.mda_pair_attrs[pair][0]
+                    # Keep shortest attribute if multiple partners
+                    if lid not in attr_for_label or \
+                            len(attr) < len(attr_for_label[lid]):
+                        attr_for_label[lid] = attr
+
+        if not attr_for_label:
+            return text
+
+        augmented = dict(text)
+        for lid, attr in attr_for_label.items():
+            key = str(lid)
+            if key in augmented:
+                augmented[key] = f"{augmented[key]}, {attr}"
+        return augmented
 
     def transform(self, results: dict) -> dict:
         if 'phrases' in results:
@@ -246,6 +334,53 @@ class RandomSamplingNegPos(BaseTransform):
             else:
                 break
         negative_label_list = screened_negative_label_list
+
+        # MDA augmentation: append attribute descriptions to class names
+        # when confusable pairs co-occur in the prompt
+        if self.mda_pair_attrs is not None:
+            all_labels = [int(x) for x in negative_label_list] + \
+                positive_label_list
+            aug_text = self._augment_text_with_mda(text, all_labels)
+
+            # Re-check token budget with augmented text
+            total_tokens = sum(
+                len(self.tokenizer.tokenize(
+                    clean_name(aug_text[str(l)]) + '. '))
+                for l in all_labels)
+
+            if total_tokens <= self.max_tokens:
+                text = aug_text
+            else:
+                # Over budget: drop augmentations for negatives first,
+                # then positives, until it fits
+                aug_text = dict(text)
+                augmented_ids = []
+                all_ids_set = set(all_labels)
+                for lid in all_ids_set:
+                    for partner in all_ids_set:
+                        if lid != partner and \
+                                (lid, partner) in self.mda_pair_attrs:
+                            attr = self.mda_pair_attrs[(lid, partner)][0]
+                            key = str(lid)
+                            if key in aug_text:
+                                aug_text[key] = f"{text[key]}, {attr}"
+                                augmented_ids.append(lid)
+                            break
+                # Remove augmentations one by one until budget fits
+                # (negatives first)
+                neg_set = set(int(x) for x in negative_label_list)
+                ordered = [x for x in augmented_ids if x in neg_set] + \
+                    [x for x in augmented_ids if x not in neg_set]
+                for lid in ordered:
+                    total_tokens = sum(
+                        len(self.tokenizer.tokenize(
+                            clean_name(aug_text[str(l)]) + '. '))
+                        for l in all_labels)
+                    if total_tokens <= self.max_tokens:
+                        break
+                    aug_text[str(lid)] = text[str(lid)]
+                text = aug_text
+
         label_to_positions, pheso_caption, label_remap_dict, \
             all_label_index_map = \
             generate_senetence_given_labels(positive_label_list,
