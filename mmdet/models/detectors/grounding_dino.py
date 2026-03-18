@@ -540,6 +540,14 @@ class GroundingDINO(DINO):
         head_inputs_dict = self.forward_transformer(visual_features, text_dict,
                                                     batch_data_samples)
 
+        # Lazily build MDA embedding cache on first forward pass
+        if hasattr(self.bbox_head, 'mda_cache') \
+                and self.bbox_head.mda_cache is not None \
+                and not self.bbox_head.mda_cache.is_built:
+            self.bbox_head.mda_cache.build_cache(
+                self.language_model, self.text_feat_map,
+                batch_inputs.device)
+
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
         return losses

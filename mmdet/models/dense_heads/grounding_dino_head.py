@@ -16,7 +16,7 @@ from mmdet.structures import SampleList
 from mmdet.structures.bbox import bbox_cxcywh_to_xyxy, bbox_xyxy_to_cxcywh
 from mmdet.utils import InstanceList, reduce_mean
 from ..layers import inverse_sigmoid
-from ..mda import ConfusableSetManager, PlainMarginLoss
+from ..mda import ConfusableSetManager, MDAEmbeddingCache, PlainMarginLoss
 from .atss_vlfusion_head import convert_grounding_to_cls_scores
 from .dino_head import DINOHead
 
@@ -111,10 +111,12 @@ class GroundingDINOHead(DINOHead):
     def __init__(self,
                  contrastive_cfg=dict(max_text_len=256),
                  margin_config=None,
+                 mda_margin_config=None,
                  **kwargs):
         self.contrastive_cfg = contrastive_cfg
         self.max_text_len = contrastive_cfg.get('max_text_len', 256)
         self.margin_config = margin_config
+        self.mda_margin_config = mda_margin_config
         super().__init__(**kwargs)
         # Initialise margin loss components (after super().__init__)
         if margin_config is not None:
@@ -128,6 +130,26 @@ class GroundingDINOHead(DINOHead):
             self._margin_iter = 0
         else:
             self.confusable_mgr = None
+
+        # Initialise MDA margin loss components (Exp-2)
+        if mda_margin_config is not None:
+            self.mda_cache = MDAEmbeddingCache(
+                mda_attributes_path=mda_margin_config[
+                    'mda_attributes_path'],
+                lvis_categories_path=mda_margin_config[
+                    'lvis_categories_path'],
+                confusable_index_path=mda_margin_config[
+                    'confusable_index_path'],
+                num_negatives=mda_margin_config.get('num_negatives', 3))
+            self.mda_margin_loss_fn = PlainMarginLoss(
+                margin=mda_margin_config.get('margin', 0.2))
+            self.mda_margin_loss_weight = mda_margin_config.get(
+                'loss_weight', 0.5)
+            self.mda_margin_warmup_iters = mda_margin_config.get(
+                'warmup_iters', 500)
+            self._mda_margin_iter = 0
+        else:
+            self.mda_cache = None
 
     def _init_layers(self) -> None:
         """Initialize classification branch and regression branch of head."""
@@ -537,6 +559,27 @@ class GroundingDINOHead(DINOHead):
                     batch_img_metas, batch_data_samples)
                 losses['loss_margin'] = loss_margin * self.margin_loss_weight
 
+        # MDA Margin Loss (Exp-2)
+        if self.mda_cache is not None and self.mda_cache.is_built:
+            self._mda_margin_iter += 1
+            if self._mda_margin_iter > self.mda_margin_warmup_iters:
+                # Split matching vs denoising queries
+                (all_matching_cls, all_matching_bbox, _, _) = \
+                    self.split_outputs(outs[0], outs[1], dn_meta)
+                last_cls = all_matching_cls[-1]
+                last_bbox = all_matching_bbox[-1]
+                # Get last layer hidden states (pre-ContrastiveEmbed)
+                # hidden_states: [num_layers, bs, nq_total, 256]
+                num_dn = dn_meta['num_denoising_queries'] \
+                    if dn_meta is not None else 0
+                last_hidden = hidden_states[-1][:, num_dn:, :]  # [bs,nq,256]
+                loss_mda = self._compute_mda_margin_loss(
+                    last_hidden, last_cls, last_bbox,
+                    batch_gt_instances, batch_img_metas,
+                    batch_data_samples)
+                losses['loss_mda_margin'] = \
+                    loss_mda * self.mda_margin_loss_weight
+
         return losses
 
     def _compute_margin_loss(self, last_cls: Tensor, last_bbox: Tensor,
@@ -650,6 +693,123 @@ class GroundingDINOHead(DINOHead):
         total_loss = last_cls.new_zeros(1).squeeze()
         for s_pos, s_neg in zip(all_pos_scores, all_neg_scores):
             total_loss = total_loss + self.margin_loss_fn(
+                s_pos.unsqueeze(0),
+                s_neg.unsqueeze(0))
+        return total_loss / len(all_pos_scores)
+
+    def _compute_mda_margin_loss(
+            self, last_hidden: Tensor, last_cls: Tensor, last_bbox: Tensor,
+            batch_gt_instances: InstanceList,
+            batch_img_metas: List[dict],
+            batch_data_samples: SampleList) -> Tensor:
+        """Compute MDA Margin Loss using pre-computed MDA attribute embeddings.
+
+        Instead of using class name token scores from the prompt, computes
+        dot product between query embeddings and cached MDA attribute
+        embeddings to get discriminative scores.
+
+        Args:
+            last_hidden: Decoder output [bs, nq, 256] (pre-ContrastiveEmbed).
+            last_cls: Classification scores [bs, nq, max_text_len].
+            last_bbox: Bbox predictions [bs, nq, 4].
+            batch_gt_instances: GT instances per image.
+            batch_img_metas: Image meta info per image.
+            batch_data_samples: Full data samples.
+        """
+        # Get ContrastiveEmbed scaling parameters
+        ce = self.cls_branches[-1]  # last layer's ContrastiveEmbed
+        log_scale = ce.log_scale
+        bias = ce.bias
+
+        all_pos_scores = []
+        all_neg_scores = []
+
+        for i in range(len(batch_gt_instances)):
+            gt_instances = batch_gt_instances[i]
+            img_meta = batch_img_metas[i]
+            cls_score_i = last_cls[i]   # [nq, max_text_len]
+            bbox_pred_i = last_bbox[i]  # [nq, 4]
+            hidden_i = last_hidden[i]   # [nq, 256]
+
+            remap = img_meta.get('label_remap_dict', None)
+            if remap is None:
+                continue
+            inv_remap = {v: k for k, v in remap.items()}
+
+            # Hungarian matching
+            img_h, img_w = img_meta['img_shape']
+            factor = bbox_pred_i.new_tensor(
+                [img_w, img_h, img_w, img_h]).unsqueeze(0)
+            bbox_xyxy = bbox_cxcywh_to_xyxy(bbox_pred_i) * factor
+
+            with torch.no_grad():
+                pred_inst = InstanceData(
+                    scores=cls_score_i, bboxes=bbox_xyxy)
+                assign_result = self.assigner.assign(
+                    pred_instances=pred_inst,
+                    gt_instances=gt_instances,
+                    img_meta=img_meta)
+
+            pos_inds = torch.nonzero(
+                assign_result.gt_inds > 0,
+                as_tuple=False).squeeze(-1).unique()
+            if len(pos_inds) == 0:
+                continue
+
+            pos_gt_inds = assign_result.gt_inds[pos_inds] - 1
+            gt_labels_matched = gt_instances.labels[pos_gt_inds]
+
+            for q_idx, gt_lbl in zip(pos_inds, gt_labels_matched):
+                local_id = gt_lbl.item()
+                orig_cls_id = inv_remap.get(local_id, None)
+                if orig_cls_id is None:
+                    continue
+
+                neg_ids = self.mda_cache.get_negatives(orig_cls_id)
+                if not neg_ids:
+                    continue
+
+                # Query embedding
+                query_emb = hidden_i[q_idx]  # [256]
+
+                neg_scores_list = []
+                pos_score = None
+                for neg_id in neg_ids:
+                    pair = self.mda_cache.get_pair(orig_cls_id, neg_id)
+                    if pair is None:
+                        continue
+                    attr_a_emb, attr_b_emb = pair  # each [256]
+                    attr_a_emb = attr_a_emb.to(query_emb.device)
+                    attr_b_emb = attr_b_emb.to(query_emb.device)
+
+                    # Score = query · mda_emb (same as ContrastiveEmbed)
+                    s_a = torch.dot(query_emb, attr_a_emb)
+                    s_b = torch.dot(query_emb, attr_b_emb)
+
+                    # Apply ContrastiveEmbed scaling
+                    if isinstance(log_scale, nn.Parameter):
+                        s_a = s_a * log_scale.exp()
+                        s_b = s_b * log_scale.exp()
+                    if bias is not None:
+                        s_a = s_a + bias
+                        s_b = s_b + bias
+
+                    # s_a = score for positive class attribute
+                    # s_b = score for negative class attribute
+                    if pos_score is None:
+                        pos_score = s_a
+                    neg_scores_list.append(s_b)
+
+                if pos_score is not None and neg_scores_list:
+                    all_pos_scores.append(pos_score)
+                    all_neg_scores.append(torch.stack(neg_scores_list))
+
+        if not all_pos_scores:
+            return last_cls.new_zeros(1).squeeze()
+
+        total_loss = last_cls.new_zeros(1).squeeze()
+        for s_pos, s_neg in zip(all_pos_scores, all_neg_scores):
+            total_loss = total_loss + self.mda_margin_loss_fn(
                 s_pos.unsqueeze(0),
                 s_neg.unsqueeze(0))
         return total_loss / len(all_pos_scores)
