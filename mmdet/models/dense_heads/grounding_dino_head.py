@@ -786,13 +786,15 @@ class GroundingDINOHead(DINOHead):
                     s_a = torch.dot(query_emb, attr_a_emb)
                     s_b = torch.dot(query_emb, attr_b_emb)
 
-                    # Apply ContrastiveEmbed scaling
+                    # Apply ContrastiveEmbed scaling then sigmoid
                     if isinstance(log_scale, nn.Parameter):
                         s_a = s_a * log_scale.exp()
                         s_b = s_b * log_scale.exp()
                     if bias is not None:
                         s_a = s_a + bias
                         s_b = s_b + bias
+                    s_a = torch.sigmoid(s_a)
+                    s_b = torch.sigmoid(s_b)
 
                     # s_a = score for positive class attribute
                     # s_b = score for negative class attribute
