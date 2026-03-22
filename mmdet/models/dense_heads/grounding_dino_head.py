@@ -112,11 +112,13 @@ class GroundingDINOHead(DINOHead):
                  contrastive_cfg=dict(max_text_len=256),
                  margin_config=None,
                  mda_margin_config=None,
+                 mda_fused_config=None,
                  **kwargs):
         self.contrastive_cfg = contrastive_cfg
         self.max_text_len = contrastive_cfg.get('max_text_len', 256)
         self.margin_config = margin_config
         self.mda_margin_config = mda_margin_config
+        self.mda_fused_config = mda_fused_config
         super().__init__(**kwargs)
         # Initialise margin loss components (after super().__init__)
         if margin_config is not None:
@@ -150,6 +152,18 @@ class GroundingDINOHead(DINOHead):
             self._mda_margin_iter = 0
         else:
             self.mda_cache = None
+
+        # B3: Fused MDA margin loss (MDA tokens in prompt, fused via encoder)
+        if mda_fused_config is not None:
+            self.fused_margin_loss_fn = PlainMarginLoss(
+                margin=mda_fused_config.get('margin', 0.2))
+            self.fused_margin_loss_weight = mda_fused_config.get(
+                'loss_weight', 0.5)
+            self.fused_margin_warmup_iters = mda_fused_config.get(
+                'warmup_iters', 500)
+            self._fused_margin_iter = 0
+            self._fused_diag_interval = mda_fused_config.get(
+                'diag_interval', 50)
 
     def _init_layers(self) -> None:
         """Initialize classification branch and regression branch of head."""
@@ -580,6 +594,22 @@ class GroundingDINOHead(DINOHead):
                 losses['loss_mda_margin'] = \
                     loss_mda * self.mda_margin_loss_weight
 
+        # B3: Fused MDA Margin Loss (MDA embeddings from memory_text)
+        if self.mda_fused_config is not None:
+            self._fused_margin_iter += 1
+            if self._fused_margin_iter > self.fused_margin_warmup_iters:
+                (all_matching_cls, all_matching_bbox, _, _) = \
+                    self.split_outputs(outs[0], outs[1], dn_meta)
+                last_cls = all_matching_cls[-1]
+                last_bbox = all_matching_bbox[-1]
+                loss_fused = self._compute_fused_mda_margin_loss(
+                    memory_text, text_token_mask,
+                    last_cls, last_bbox,
+                    batch_gt_instances, batch_img_metas,
+                    batch_data_samples)
+                losses['loss_fused_mda'] = \
+                    loss_fused * self.fused_margin_loss_weight
+
         return losses
 
     def _compute_margin_loss(self, last_cls: Tensor, last_bbox: Tensor,
@@ -812,6 +842,167 @@ class GroundingDINOHead(DINOHead):
         total_loss = last_cls.new_zeros(1).squeeze()
         for s_pos, s_neg in zip(all_pos_scores, all_neg_scores):
             total_loss = total_loss + self.mda_margin_loss_fn(
+                s_pos.unsqueeze(0),
+                s_neg.unsqueeze(0))
+        return total_loss / len(all_pos_scores)
+
+    def _compute_fused_mda_margin_loss(
+            self, memory_text: Tensor, text_token_mask: Tensor,
+            last_cls: Tensor, last_bbox: Tensor,
+            batch_gt_instances: InstanceList,
+            batch_img_metas: List[dict],
+            batch_data_samples: SampleList) -> Tensor:
+        """B3: Fused MDA Margin Loss using encoder-fused MDA embeddings.
+
+        MDA attribute texts are appended to the prompt as separate
+        sub-sentences, go through BERT + encoder cross-attention, and
+        their fused embeddings are extracted from memory_text.
+        Score = query · fused_mda_emb (same space as cls_score).
+
+        Args:
+            memory_text: Encoder-fused text features [bs, num_tokens, 256].
+            text_token_mask: Valid token mask [bs, num_tokens].
+            last_cls: Classification scores [bs, nq, max_text_len].
+            last_bbox: Bbox predictions [bs, nq, 4].
+            batch_gt_instances: GT instances per image.
+            batch_img_metas: Image meta info per image.
+            batch_data_samples: Full data samples.
+        """
+        # Get ContrastiveEmbed scaling parameters
+        ce = self.cls_branches[-1]
+        log_scale = ce.log_scale
+        bias = ce.bias
+
+        all_pos_scores = []
+        all_neg_scores = []
+        # Diagnostics
+        all_pos_raw = []
+        all_neg_raw = []
+        all_cosines = []
+
+        for i in range(len(batch_gt_instances)):
+            gt_instances = batch_gt_instances[i]
+            img_meta = batch_img_metas[i]
+            data_sample = batch_data_samples[i]
+            cls_score_i = last_cls[i]
+            bbox_pred_i = last_bbox[i]
+            mem_text_i = memory_text[i]  # [num_tokens, 256]
+
+            remap = img_meta.get('label_remap_dict', None)
+            if remap is None:
+                continue
+            inv_remap = {v: k for k, v in remap.items()}
+
+            # Get MDA token indices (char→token already converted)
+            mda_indices = getattr(data_sample, 'mda_token_indices', None)
+            if not mda_indices:
+                continue
+
+            # Get all_label_index_map for class name token positions
+            all_lim = img_meta.get('all_label_index_map', None)
+
+            # Hungarian matching
+            img_h, img_w = img_meta['img_shape']
+            factor = bbox_pred_i.new_tensor(
+                [img_w, img_h, img_w, img_h]).unsqueeze(0)
+            bbox_xyxy = bbox_cxcywh_to_xyxy(bbox_pred_i) * factor
+
+            with torch.no_grad():
+                pred_inst = InstanceData(
+                    scores=cls_score_i, bboxes=bbox_xyxy)
+                assign_result = self.assigner.assign(
+                    pred_instances=pred_inst,
+                    gt_instances=gt_instances,
+                    img_meta=img_meta)
+
+            pos_inds = torch.nonzero(
+                assign_result.gt_inds > 0,
+                as_tuple=False).squeeze(-1).unique()
+            if len(pos_inds) == 0:
+                continue
+
+            pos_gt_inds = assign_result.gt_inds[pos_inds] - 1
+            gt_labels_matched = gt_instances.labels[pos_gt_inds]
+
+            for q_idx, gt_lbl in zip(pos_inds, gt_labels_matched):
+                local_id = gt_lbl.item()
+                orig_cls_id = inv_remap.get(local_id, None)
+                if orig_cls_id is None:
+                    continue
+
+                # Find MDA pairs involving this class
+                for pair_key, tok_idx in mda_indices.items():
+                    cls_idx, neg_idx = pair_key
+                    if cls_idx != orig_cls_id:
+                        continue
+
+                    pos_tok_s, pos_tok_e = tok_idx['pos']
+                    neg_tok_s, neg_tok_e = tok_idx['neg']
+
+                    # Extract fused MDA embeddings (mean pool over tokens)
+                    pos_emb = mem_text_i[pos_tok_s:pos_tok_e + 1].mean(dim=0)
+                    neg_emb = mem_text_i[neg_tok_s:neg_tok_e + 1].mean(dim=0)
+
+                    # Query embedding from cls_score perspective:
+                    # cls_score = query · memory_text already computed.
+                    # We need to get the score for the MDA token positions.
+                    # Use the pre-computed cls_score at MDA token positions.
+                    s_pos = cls_score_i[q_idx, pos_tok_s:pos_tok_e + 1].mean()
+                    s_neg = cls_score_i[q_idx, neg_tok_s:neg_tok_e + 1].mean()
+
+                    # Diagnostics: raw scores and cosine similarity
+                    all_pos_raw.append(s_pos.item())
+                    all_neg_raw.append(s_neg.item())
+
+                    # Cosine sim between MDA emb and class name emb
+                    if all_lim is not None and orig_cls_id in all_lim:
+                        full_pm = data_sample.full_positive_map
+                        _, cls_char_spans = all_lim[orig_cls_id]
+                        # Get class name token positions from full_pm
+                        pm_idx = all_lim[orig_cls_id][0]
+                        if pm_idx in full_pm:
+                            cls_tok_positions = torch.nonzero(
+                                full_pm[pm_idx],
+                                as_tuple=True)[0]
+                            if len(cls_tok_positions) > 0:
+                                cls_emb = mem_text_i[
+                                    cls_tok_positions].mean(dim=0)
+                                cos = torch.nn.functional.cosine_similarity(
+                                    pos_emb.unsqueeze(0),
+                                    cls_emb.unsqueeze(0)).item()
+                                all_cosines.append(cos)
+
+                    all_pos_scores.append(s_pos)
+                    all_neg_scores.append(s_neg)
+
+        # Diagnostic logging
+        if all_pos_raw and self._fused_margin_iter % \
+                self._fused_diag_interval == 0:
+            import logging
+            logger = logging.getLogger('mmdet')
+            n = len(all_pos_raw)
+            ratio = sum(1 for p, ng in zip(all_pos_raw, all_neg_raw)
+                        if p > ng) / n
+            avg_pos = sum(all_pos_raw) / n
+            avg_neg = sum(all_neg_raw) / n
+            msg = (f'[iter {self._fused_margin_iter}] '
+                   f'MDA signal: pos={avg_pos:.3f}, neg={avg_neg:.3f}, '
+                   f'ratio={ratio:.2%}, n_pairs={n}')
+            if all_cosines:
+                avg_cos = sum(all_cosines) / len(all_cosines)
+                min_cos = min(all_cosines)
+                max_cos = max(all_cosines)
+                msg += (f' | MDA-classname cosine: '
+                        f'mean={avg_cos:.3f}, '
+                        f'min={min_cos:.3f}, max={max_cos:.3f}')
+            logger.info(msg)
+
+        if not all_pos_scores:
+            return last_cls.new_zeros(1).squeeze()
+
+        total_loss = last_cls.new_zeros(1).squeeze()
+        for s_pos, s_neg in zip(all_pos_scores, all_neg_scores):
+            total_loss = total_loss + self.fused_margin_loss_fn(
                 s_pos.unsqueeze(0),
                 s_neg.unsqueeze(0))
         return total_loss / len(all_pos_scores)

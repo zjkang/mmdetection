@@ -187,40 +187,39 @@ class RandomSamplingNegPos(BaseTransform):
         token_ids = self.tokenizer.convert_tokens_to_ids(tokens[:max_tokens])
         return self.tokenizer.decode(token_ids).strip()
 
-    def _augment_text_with_mda(self, text, all_label_ids):
-        """Augment class names with MDA attributes for confusable pairs.
+    def _collect_mda_pairs(self, all_label_ids):
+        """Collect MDA attribute pairs for confusable classes in the prompt.
 
-        Only augments when both classes of a pair are in the prompt.
-        Returns a shallow copy of text with augmented names.
+        For each positive class with a confusable partner also in the prompt,
+        collects the (cls_idx, neg_idx, attr_for_cls, attr_for_neg) tuple.
+        Used by B3 to append MDA sub-sentences to the prompt.
+
+        Returns:
+            list of (cls_idx, neg_idx, attr_cls, attr_neg) tuples.
         """
         if self.mda_pair_attrs is None:
-            return text
+            return []
 
         all_ids_set = set(int(x) for x in all_label_ids)
-        attr_for_label = {}
+        seen_pairs = set()
+        mda_pairs = []
 
         for lid in all_ids_set:
-            # Collect all candidate attributes from confusable partners
             candidates = []
             for partner in all_ids_set:
                 if lid == partner:
                     continue
                 pair = (lid, partner)
-                if pair in self.mda_pair_attrs:
-                    candidates.append(self.mda_pair_attrs[pair][0])
-            if candidates and random.random() < self.mda_aug_prob:
-                # Randomly pick one so different epochs see different attrs
-                attr_for_label[lid] = random.choice(candidates)
+                if pair in self.mda_pair_attrs and pair not in seen_pairs:
+                    candidates.append((partner, self.mda_pair_attrs[pair]))
+            if candidates:
+                # Randomly pick one partner
+                partner, (attr_cls, attr_neg) = random.choice(candidates)
+                seen_pairs.add((lid, partner))
+                seen_pairs.add((partner, lid))
+                mda_pairs.append((lid, partner, attr_cls, attr_neg))
 
-        if not attr_for_label:
-            return text
-
-        augmented = dict(text)
-        for lid, attr in attr_for_label.items():
-            key = str(lid)
-            if key in augmented:
-                augmented[key] = f"{augmented[key]}, {attr}"
-        return augmented
+        return mda_pairs
 
     def transform(self, results: dict) -> dict:
         if 'phrases' in results:
@@ -338,56 +337,53 @@ class RandomSamplingNegPos(BaseTransform):
                 break
         negative_label_list = screened_negative_label_list
 
-        # MDA augmentation: append attribute descriptions to class names
-        # when confusable pairs co-occur in the prompt
-        if self.mda_pair_attrs is not None:
-            all_labels = [int(x) for x in negative_label_list] + \
-                positive_label_list
-            aug_text = self._augment_text_with_mda(text, all_labels)
-
-            # Re-check token budget with augmented text
-            total_tokens = sum(
-                len(self.tokenizer.tokenize(
-                    clean_name(aug_text[str(l)]) + '. '))
-                for l in all_labels)
-
-            if total_tokens <= self.max_tokens:
-                text = aug_text
-            else:
-                # Over budget: drop augmentations for negatives first,
-                # then positives, until it fits
-                aug_text = dict(text)
-                augmented_ids = []
-                all_ids_set = set(all_labels)
-                for lid in all_ids_set:
-                    for partner in all_ids_set:
-                        if lid != partner and \
-                                (lid, partner) in self.mda_pair_attrs:
-                            attr = self.mda_pair_attrs[(lid, partner)][0]
-                            key = str(lid)
-                            if key in aug_text:
-                                aug_text[key] = f"{text[key]}, {attr}"
-                                augmented_ids.append(lid)
-                            break
-                # Remove augmentations one by one until budget fits
-                # (negatives first)
-                neg_set = set(int(x) for x in negative_label_list)
-                ordered = [x for x in augmented_ids if x in neg_set] + \
-                    [x for x in augmented_ids if x not in neg_set]
-                for lid in ordered:
-                    total_tokens = sum(
-                        len(self.tokenizer.tokenize(
-                            clean_name(aug_text[str(l)]) + '. '))
-                        for l in all_labels)
-                    if total_tokens <= self.max_tokens:
-                        break
-                    aug_text[str(lid)] = text[str(lid)]
-                text = aug_text
-
+        # Generate class name prompt (unchanged — no MDA in class names)
         label_to_positions, pheso_caption, label_remap_dict, \
             all_label_index_map = \
             generate_senetence_given_labels(positive_label_list,
                                             negative_label_list, text)
+
+        # B3: Append MDA attribute sub-sentences AFTER class names
+        # These are separate sub-sentences that don't modify class names.
+        # Format: "... classN . mda_attr_1 . mda_attr_2 . ..."
+        # Each MDA attr gets its own sub-sentence (isolated in BERT attn).
+        mda_token_spans = {}  # "cls_idx,neg_idx" → {'pos': [s,e], 'neg': [s,e]}
+        if self.mda_pair_attrs is not None:
+            all_labels = [int(x) for x in negative_label_list] + \
+                positive_label_list
+            mda_pairs = self._collect_mda_pairs(all_labels)
+
+            # Compute remaining token budget
+            current_tokens = len(self.tokenizer.tokenize(pheso_caption))
+            remaining = self.max_tokens - current_tokens - 5  # safety margin
+
+            for cls_idx, neg_idx, attr_cls, attr_neg in mda_pairs:
+                # Each MDA sub-sentence: "attr_text . "
+                attr_cls_text = attr_cls.lower().strip()
+                attr_neg_text = attr_neg.lower().strip()
+                candidate = f'{attr_cls_text} . {attr_neg_text} . '
+                candidate_tokens = len(self.tokenizer.tokenize(candidate))
+
+                if candidate_tokens > remaining:
+                    break  # no more budget
+
+                # Record char positions for positive attr
+                pos_start = len(pheso_caption)
+                pheso_caption += attr_cls_text
+                pos_end = len(pheso_caption)
+                pheso_caption += ' . '
+
+                # Record char positions for negative attr
+                neg_start = len(pheso_caption)
+                pheso_caption += attr_neg_text
+                neg_end = len(pheso_caption)
+                pheso_caption += ' . '
+
+                mda_token_spans[f'{cls_idx},{neg_idx}'] = {
+                    'pos': [pos_start, pos_end],
+                    'neg': [neg_start, neg_end],
+                }
+                remaining -= candidate_tokens
 
         # label remap
         if len(gt_labels) > 0:
@@ -403,6 +399,8 @@ class RandomSamplingNegPos(BaseTransform):
         results['all_label_index_map'] = all_label_index_map
         # Also pass original-id → prompt-local remap for GT classes
         results['label_remap_dict'] = label_remap_dict
+        # B3: MDA attribute char spans for fused margin loss
+        results['mda_token_spans'] = mda_token_spans
 
         return results
 

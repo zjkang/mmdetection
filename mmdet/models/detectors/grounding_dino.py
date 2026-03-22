@@ -474,6 +474,32 @@ class GroundingDINO(DINO):
                     full_positive_maps.append(
                         {cid: full_pm[i]
                          for i, cid in enumerate(all_class_ids)})
+
+                # B3: Convert MDA char spans to BERT token indices
+                # (reuse tokenized from above to avoid double tokenization)
+                mda_spans = batch_data_samples[idx].metainfo.get(
+                    'mda_token_spans', None)
+                if mda_spans:
+                    mda_token_indices = {}
+                    for pair_key_str, spans in mda_spans.items():
+                        cls_idx, neg_idx = [
+                            int(x) for x in pair_key_str.split(',')]
+                        pos_s, pos_e = spans['pos']
+                        neg_s, neg_e = spans['neg']
+                        pos_tok_s = tokenized.char_to_token(0, pos_s)
+                        pos_tok_e = tokenized.char_to_token(0, pos_e - 1)
+                        neg_tok_s = tokenized.char_to_token(0, neg_s)
+                        neg_tok_e = tokenized.char_to_token(0, neg_e - 1)
+                        if None in (
+                                pos_tok_s, pos_tok_e, neg_tok_s, neg_tok_e):
+                            continue
+                        mda_token_indices[(cls_idx, neg_idx)] = {
+                            'pos': (pos_tok_s, pos_tok_e),
+                            'neg': (neg_tok_s, neg_tok_e),
+                        }
+                    batch_data_samples[idx].mda_token_indices = \
+                        mda_token_indices
+
             new_text_prompts = text_prompts
         else:
             new_text_prompts = []
