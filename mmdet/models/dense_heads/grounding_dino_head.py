@@ -979,8 +979,7 @@ class GroundingDINOHead(DINOHead):
         # Diagnostic logging
         if all_pos_raw and self._fused_margin_iter % \
                 self._fused_diag_interval == 0:
-            import logging
-            logger = logging.getLogger('mmdet')
+            from mmengine.logging import print_log
             n = len(all_pos_raw)
             ratio = sum(1 for p, ng in zip(all_pos_raw, all_neg_raw)
                         if p > ng) / n
@@ -996,7 +995,7 @@ class GroundingDINOHead(DINOHead):
                 msg += (f' | MDA-classname cosine: '
                         f'mean={avg_cos:.3f}, '
                         f'min={min_cos:.3f}, max={max_cos:.3f}')
-            logger.info(msg)
+            print_log(msg, logger='current')
 
         if not all_pos_scores:
             return last_cls.new_zeros(1).squeeze()
