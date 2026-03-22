@@ -205,19 +205,15 @@ class RandomSamplingNegPos(BaseTransform):
         mda_pairs = []
 
         for lid in all_ids_set:
-            candidates = []
             for partner in all_ids_set:
                 if lid == partner:
                     continue
                 pair = (lid, partner)
                 if pair in self.mda_pair_attrs and pair not in seen_pairs:
-                    candidates.append((partner, self.mda_pair_attrs[pair]))
-            if candidates:
-                # Randomly pick one partner
-                partner, (attr_cls, attr_neg) = random.choice(candidates)
-                seen_pairs.add((lid, partner))
-                seen_pairs.add((partner, lid))
-                mda_pairs.append((lid, partner, attr_cls, attr_neg))
+                    attr_cls, attr_neg = self.mda_pair_attrs[pair]
+                    seen_pairs.add(pair)
+                    seen_pairs.add((partner, lid))  # deduplicate reverse
+                    mda_pairs.append((lid, partner, attr_cls, attr_neg))
 
         return mda_pairs
 

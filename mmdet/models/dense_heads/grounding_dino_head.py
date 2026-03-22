@@ -926,21 +926,28 @@ class GroundingDINOHead(DINOHead):
                     continue
 
                 # Find MDA pairs involving this class
+                # Check both directions: if pair is (A, B) with
+                # pos=attr_A, neg=attr_B, then:
+                #   - For query class A: pos=attr_A, neg=attr_B (direct)
+                #   - For query class B: pos=attr_B, neg=attr_A (reversed)
                 for pair_key, tok_idx in mda_indices.items():
                     cls_idx, neg_idx = pair_key
-                    if cls_idx != orig_cls_id:
+                    if cls_idx == orig_cls_id:
+                        # Direct: this query's class is cls_idx
+                        pos_tok_s, pos_tok_e = tok_idx['pos']
+                        neg_tok_s, neg_tok_e = tok_idx['neg']
+                    elif neg_idx == orig_cls_id:
+                        # Reversed: this query's class is neg_idx
+                        # Swap pos/neg so margin pushes the right direction
+                        pos_tok_s, pos_tok_e = tok_idx['neg']
+                        neg_tok_s, neg_tok_e = tok_idx['pos']
+                    else:
                         continue
-
-                    pos_tok_s, pos_tok_e = tok_idx['pos']
-                    neg_tok_s, neg_tok_e = tok_idx['neg']
 
                     # Extract fused MDA embeddings (mean pool over tokens)
                     pos_emb = mem_text_i[pos_tok_s:pos_tok_e + 1].mean(dim=0)
                     neg_emb = mem_text_i[neg_tok_s:neg_tok_e + 1].mean(dim=0)
 
-                    # Query embedding from cls_score perspective:
-                    # cls_score = query · memory_text already computed.
-                    # We need to get the score for the MDA token positions.
                     # Use the pre-computed cls_score at MDA token positions.
                     s_pos = cls_score_i[q_idx, pos_tok_s:pos_tok_e + 1].mean()
                     s_neg = cls_score_i[q_idx, neg_tok_s:neg_tok_e + 1].mean()
