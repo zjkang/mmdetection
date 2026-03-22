@@ -868,11 +868,6 @@ class GroundingDINOHead(DINOHead):
             batch_img_metas: Image meta info per image.
             batch_data_samples: Full data samples.
         """
-        # Get ContrastiveEmbed scaling parameters
-        ce = self.cls_branches[-1]
-        log_scale = ce.log_scale
-        bias = ce.bias
-
         all_pos_scores = []
         all_neg_scores = []
         # Diagnostics
@@ -957,19 +952,18 @@ class GroundingDINOHead(DINOHead):
                     # Cosine sim between MDA emb and class name emb
                     if all_lim is not None and orig_cls_id in all_lim:
                         full_pm = data_sample.full_positive_map
-                        _, cls_char_spans = all_lim[orig_cls_id]
-                        # Get class name token positions from full_pm
                         pm_idx = all_lim[orig_cls_id][0]
                         if pm_idx in full_pm:
                             cls_tok_positions = torch.nonzero(
                                 full_pm[pm_idx],
                                 as_tuple=True)[0]
                             if len(cls_tok_positions) > 0:
-                                cls_emb = mem_text_i[
-                                    cls_tok_positions].mean(dim=0)
-                                cos = torch.nn.functional.cosine_similarity(
-                                    pos_emb.unsqueeze(0),
-                                    cls_emb.unsqueeze(0)).item()
+                                with torch.no_grad():
+                                    cls_emb = mem_text_i[
+                                        cls_tok_positions].mean(dim=0)
+                                    cos = torch.nn.functional.cosine_similarity(
+                                        pos_emb.detach().unsqueeze(0),
+                                        cls_emb.unsqueeze(0)).item()
                                 all_cosines.append(cos)
 
                     all_pos_scores.append(s_pos)
